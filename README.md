@@ -3,7 +3,7 @@
 `xc` turns every tool in Xcode 27's MCP server (`xcrun mcpbridge`) into a shell command:
 
 ```sh
-xc build                                  # BuildProject in the workspace found from the cwd
+xc build -w App.xcworkspace               # BuildProject for that workspace
 xc test                                   # RunAllTests
 xc grep 'TODO' --output-mode content      # XcodeGrep
 xc console --oslog-severity error         # GetConsoleOutput
@@ -102,8 +102,26 @@ If a tool has an argument with the same name as one of `xc`'s own options, the t
 keeps the name and `xc`'s option becomes `--xc-<name>`. For example, `xc preview` has its own
 `--timeout`, so `xc`'s timeout for it is `--xc-timeout`.
 
-**Workspace.** For tools that take a `workspaceIdentifier`, `xc` uses `-w/--workspace`, then
-`$XC_WORKSPACE`, then the nearest `.xcworkspace` or `.xcodeproj` above the current folder.
+**Workspace.** `xc` sends only the arguments you give it. `-w` is shorthand for the tool's
+`--workspace-identifier` (a relative path is made absolute, since Xcode doesn't run in your
+folder), or for `--tab-identifier` with `-X`. Leave it out and Xcode decides, exactly as it
+would over MCP.
+
+**Which Xcode.** By default `mcpbridge` talks to the background Xcode Service, which opens
+workspaces itself (`xc workspaces`, `xc open`). `-X <pid>` (or `MCP_XCODE_PID`) talks to that
+running Xcode app instead. Its tools use window tabs rather than workspaces: `xc instances` lists
+each running Xcode with its tab identifiers. The two engines offer slightly different tools, so
+`xc tools -X <pid>` shows the app's list.
+
+```sh
+xc instances                                  # running Xcode apps, their windows and tab ids
+xc -X 94009 build -w windowtab-BaPjibjxsu     # build in that window of that Xcode
+```
+
+Two agents can build at the same time only if their projects are at different paths. Xcode keys
+its build database on the project path, so two builds of the same path fail with `database is
+locked`, even in separate Xcode instances. Give each agent its own checkout, for example a
+`git worktree`.
 
 **Output.** By default you get readable text. `--json` prints the structured result and `--raw`
 prints the full MCP response. Images such as preview renders are saved to a file (`-o DIR` picks

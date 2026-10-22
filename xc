@@ -9,13 +9,18 @@ without changes here.
   xc help build                     show a tool's flags
   xc workspaces                     XcodeListWorkspaces
   xc open MyApp.xcodeproj           XcodeOpenWorkspace (path made absolute)
-  xc build                          BuildProject in the workspace found from cwd
+  xc build -w MyApp.xcodeproj       BuildProject for that workspace
   xc grep 'TODO' --output-mode content --show-line-numbers
   xc run-some-tests --tests '{"targetName":"AppTests","testIdentifier":"AppTests/testFoo()"}'
   xc build-project --json | jq .errors
 
-Workspace: tools that take workspaceIdentifier get -w/--workspace, else
-$XC_WORKSPACE, else the nearest .xcworkspace/.xcodeproj above the cwd.
+Workspace: xc passes only what you give it. -w is shorthand for the tool's
+workspaceIdentifier (or tabIdentifier with -X); a relative path is made
+absolute. Leave it out and Xcode picks, as it would over MCP.
+
+Engines: by default mcpbridge talks to the background Xcode Service, which
+opens workspaces itself. -X PID (MCP_XCODE_PID) talks to that running Xcode
+app instead; its tools take a window tab identifier (see `xc instances`).
 
 Connection: the first call starts a background daemon that keeps one
 mcpbridge session open for the calling agent (the nearest non-shell
@@ -248,7 +253,11 @@ class Bridge:
 
 
 def load_tools(bridge, server_version):
-    path = os.path.join(CACHE_DIR, "tools-%s.json" % re.sub(r"[^\w.-]", "_", server_version or "unknown"))
+    # The background Xcode Service and an Xcode app (MCP_XCODE_PID) report the same version
+    # but offer different tools, so they're cached separately.
+    engine = "app" if os.environ.get("MCP_XCODE_PID") else "service"
+    key = "%s-%s" % (server_version or "unknown", engine)
+    path = os.path.join(CACHE_DIR, "tools-%s.json" % re.sub(r"[^\w.-]", "_", key))
     if server_version:
         try:
             with open(path) as f:
@@ -375,6 +384,23 @@ def connect_daemon(verbose):
         print("xc: daemon %s for %s[%d] (log: %s)" % (key, os.path.basename(owner["comm"]), owner["pid"],
                                                      run_path(key, ".log")), file=sys.stderr)
     return Bridge.via_socket(sock)
+
+
+def take_xcode_pid(argv):
+    """Apply -X/--xcode-pid by setting MCP_XCODE_PID, and drop it from argv."""
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-X", "--xcode-pid") or a.startswith("--xcode-pid="):
+            value = a.split("=", 1)[1] if "=" in a else (argv[i + 1] if i + 1 < len(argv) else "")
+            i += 1 if "=" in a else 2
+            if not value.isdigit():
+                raise UsageError("-X/--xcode-pid expects a process id (see `xc instances`)")
+            os.environ["MCP_XCODE_PID"] = value
+            continue
+        out.append(a)
+        i += 1
+    return out
 
 
 def open_bridge(argv):
@@ -523,6 +549,7 @@ class Daemon:
                 status = {"pid": os.getpid(), "owner": self.owner, "uptime": time.time() - self.started,
                           "idle_for": time.time() - self.last_used, "idle_timeout": self.idle_timeout,
                           "in_flight": len(self.pending), "calls": self.calls,
+                          "xcode_pid": os.environ.get("MCP_XCODE_PID"),
                           "server": (self.init_result or {}).get("serverInfo")}
             client.send({"jsonrpc": "2.0", "id": cid, "result": status})
         elif method == "notifications/cancelled":
@@ -631,6 +658,46 @@ class Daemon:
         os._exit(0)
 
 
+def cmd_instances(argv):
+    p = argparse.ArgumentParser(prog="xc instances",
+                                description="List running Xcode apps and their windows, for -X/--xcode-pid.")
+    p.add_argument("--json", action="store_true")
+    ns = p.parse_args(argv)
+    pids = [int(x) for x in subprocess.run(["pgrep", "-x", "Xcode"], capture_output=True, text=True).stdout.split()]
+    saved = os.environ.get("MCP_XCODE_PID")
+    rows = []
+    for pid in pids:
+        path = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        os.environ["MCP_XCODE_PID"] = str(pid)
+        bridge = Bridge.direct()
+        try:
+            bridge.initialize()
+            windows, error = list_windows(bridge), None
+        except UsageError as e:
+            windows, error = [], str(e)
+        finally:
+            bridge.close()
+        rows.append({"pid": pid, "app": path.split("/Contents/")[0], "windows": windows, "error": error})
+    if saved is None:
+        os.environ.pop("MCP_XCODE_PID", None)
+    else:
+        os.environ["MCP_XCODE_PID"] = saved
+    if ns.json:
+        print(json.dumps([dict(r, windows=[{"tabIdentifier": t, "workspacePath": w} for t, w in r["windows"]])
+                          for r in rows], indent=2))
+        return 0
+    print("default (no -X): the background Xcode Service (`xc status` shows its open workspaces)")
+    for r in rows:
+        print("\n-X %d  %s" % (r["pid"], r["app"]))
+        for t, w in r["windows"]:
+            print("    %s  %s" % (t, w))
+        if r["error"]:
+            print("    (couldn't list windows: %s)" % r["error"])
+        elif not r["windows"]:
+            print("    (no windows)")
+    return 0
+
+
 def fmt_duration(seconds):
     seconds = int(seconds)
     if seconds < 60:
@@ -645,8 +712,7 @@ def cmd_daemon(argv):
     p.add_argument("action", nargs="?", choices=["status", "stop"], default="status")
     p.add_argument("--all", action="store_true", help="stop: every daemon, not just this agent's")
     ns = p.parse_args(argv)
-    owner = find_owner()
-    mine = daemon_key(owner) if owner else None
+    me = find_owner()
     infos = []
     for f in sorted(os.listdir(RUN_DIR)) if os.path.isdir(RUN_DIR) else []:
         if f.endswith(".json"):
@@ -658,7 +724,8 @@ def cmd_daemon(argv):
     if ns.action == "stop":
         stopped = 0
         for key, info in infos:
-            if ns.all or key == mine:
+            owner = info.get("owner") or {}
+            if ns.all or (me and owner.get("pid") == me["pid"] and owner.get("start") == me["start"]):
                 try:
                     os.kill(info["pid"], signal.SIGTERM)
                     stopped += 1
@@ -682,10 +749,11 @@ def cmd_daemon(argv):
         finally:
             bridge.close()
         owner = st["owner"]
-        print("%s  pid %-6d owner %s[%d]  up %s  idle %s/%s  calls %d  in-flight %d%s" % (
-            key, st["pid"], os.path.basename(owner["comm"]), owner["pid"], fmt_duration(st["uptime"]),
+        engine = "app %s" % st["xcode_pid"] if st.get("xcode_pid") else "service"
+        print("%s  pid %-6d owner %s[%d]  %-9s  up %s  idle %s/%s  calls %d  in-flight %d%s" % (
+            key, st["pid"], os.path.basename(owner["comm"]), owner["pid"], engine, fmt_duration(st["uptime"]),
             fmt_duration(st["idle_for"]), fmt_duration(st["idle_timeout"]), st["calls"], st["in_flight"],
-            "  (this agent)" if key == mine else ""))
+            "  (this agent)" if me and owner["pid"] == me["pid"] and owner["start"] == me["start"] else ""))
     return 0
 
 
@@ -721,21 +789,16 @@ def short_aliases_for(tool_name, tools):
 
 # ---------------------------------------------------------------- arguments
 
-def find_workspace(start):
-    d = os.path.abspath(start)
-    while True:
-        try:
-            entries = sorted(os.listdir(d))
-        except OSError:
-            entries = []
-        ws = [e for e in entries if e.endswith(".xcworkspace")]
-        proj = [e for e in entries if e.endswith(".xcodeproj")]
-        if ws or proj:
-            return os.path.join(d, (ws or proj)[0])
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
+def list_windows(bridge):
+    """[(tabIdentifier, workspacePath)] for the windows of the Xcode app the bridge talks to."""
+    r = bridge.request("tools/call", {"name": "XcodeListWindows", "arguments": {}}, timeout=60)
+    text = (r.get("structuredContent") or {}).get("message")
+    if text is None:
+        text = " ".join(c.get("text", "") for c in r.get("content") or [])
+        parsed = maybe_json(text)
+        if isinstance(parsed, dict):
+            text = parsed.get("message", text)
+    return [(t, p.strip()) for t, p in re.findall(r"tabIdentifier: (\S+), workspacePath: (.+)", text)]
 
 
 def parse_json(text, what):
@@ -790,7 +853,10 @@ def add_global_options(p, taken=()):
         flag = "--xc-" + name if "--" + name in taken else "--" + name
         g.add_argument(*([short, flag] if short else [flag]), dest=kw.pop("dest", name.replace("-", "_")), **kw)
 
-    opt("-w", "workspace", help="workspace identifier or path (default: $XC_WORKSPACE, else found from cwd)")
+    opt("-w", "workspace", help="shorthand for --workspace-identifier (a relative path is made absolute), "
+        "or --tab-identifier with -X")
+    opt("-X", "xcode-pid", metavar="PID", help="talk to this running Xcode app instead of the background "
+        "Xcode Service (sets MCP_XCODE_PID; see `xc instances`)")
     opt(None, "args", dest="raw_args", metavar="JSON", help="tool arguments as a JSON object, or - to read stdin")
     opt(None, "json", action="store_true", help="print the structured result as JSON")
     opt(None, "raw", action="store_true", help="print the full MCP result")
@@ -821,8 +887,6 @@ def build_tool_parser(tool, tools):
     g = p.add_argument_group("tool arguments")
     taken = set()
     for name in sorted(props):
-        if name == "workspaceIdentifier":
-            continue
         ps = props[name]
         flags = ["--" + kebab(name)]
         if kebab(name) != name:
@@ -908,12 +972,14 @@ def collect_arguments(tool, ns):
     for name in list(args):
         if (tool["name"], name) in ABSPATH_ARGS and isinstance(args[name], str):
             args[name] = os.path.abspath(os.path.expanduser(args[name]))
-    if "workspaceIdentifier" in props and "workspaceIdentifier" not in args:
-        ws = ns.workspace or os.environ.get("XC_WORKSPACE") or find_workspace(os.getcwd())
-        if ws:
+    if ns.workspace:
+        if "workspaceIdentifier" in props and "workspaceIdentifier" not in args:
+            ws = ns.workspace
             if os.path.exists(os.path.expanduser(ws)):
                 ws = os.path.abspath(os.path.expanduser(ws))
             args["workspaceIdentifier"] = ws
+        if "tabIdentifier" in props and "tabIdentifier" not in args:
+            args["tabIdentifier"] = ns.workspace
     missing = [r for r in required if r not in args]
     if missing:
         raise UsageError("missing required argument(s): %s  (see `xc help %s`)"
@@ -1108,6 +1174,7 @@ Other commands:
   xc approve <id> --always          approve a pending agent/folder request (sudo)
   xc allow-folder <dir> --always    pre-permit a folder (sudo)
   xc deny <id> | xc logs
+  xc instances [--json]             running Xcode apps and their windows (for -X PID)
   xc daemon [status | stop [--all]] background connections held for agents
   xc skill install --agent NAME     install the xcode-cli Agent Skill for one agent (repeatable):
                                     claude, copilot, codex, cursor, agents, or all
@@ -1125,6 +1192,12 @@ def main(argv):
         return cmd_server(argv[1:])
     if argv[0] in SERVER_SHORTCUTS:
         return cmd_server([SERVER_SHORTCUTS[argv[0]]] + argv[1:])
+    argv = take_xcode_pid(argv)
+    if not argv:
+        usage()
+        return 0
+    if argv[0] == "instances":
+        return cmd_instances(argv[1:])
     if argv[0] == "daemon":
         return cmd_daemon(argv[1:])
     if argv[0] == "skill":

@@ -71,9 +71,14 @@ xc preview Sources/Feature/View.swift -o /tmp/previews   # render a SwiftUI prev
 xc docs "SwiftData relationships"          # search Apple developer documentation
 ```
 
-- **Pick the workspace explicitly** when more than one is open: pass `-w <identifier or absolute
-  path>`, or set `XC_WORKSPACE`. Otherwise `xc` uses the nearest `.xcworkspace` or `.xcodeproj`
-  above the current folder.
+- **Pick the workspace explicitly** whenever more than one is open: pass `-w <identifier or
+  path>` on every workspace-specific call. Without it Xcode chooses, and `xc` doesn't guess.
+- **One Xcode or several.** By default `xc` uses the background Xcode Service. `-X <pid>`
+  targets a specific running Xcode app (`xc instances` lists them with their window tabs); there,
+  `-w` takes a tab identifier.
+- **Parallel agents need separate checkouts.** Two builds of the same project path collide
+  (`database is locked`), even in separate Xcode instances. Use a separate `git worktree` per
+  agent.
 - **Confirm the scheme and destination before you build, run or test.** Switching them changes
   what the user sees in Xcode, so only switch when the task needs it.
 - **Use `--json` whenever you parse output.** It prints the tool's structured result. Exit codes:
