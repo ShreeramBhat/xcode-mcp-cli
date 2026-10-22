@@ -1047,14 +1047,17 @@ def cmd_skill(argv):
         epilog="agents: " + ", ".join("%s (%s)" % kv for kv in SKILL_TARGETS.items()))
     p.add_argument("action", choices=["install", "uninstall", "status", "path"])
     p.add_argument("--agent", action="append", choices=sorted(SKILL_TARGETS) + ["all"],
-                   help="agent to (un)install for; repeatable (default: every agent whose config folder exists)")
+                   help="agent to (un)install for; repeatable; required for install and uninstall")
     p.add_argument("--dry-run", action="store_true", help="show what would change")
     ns = p.parse_args(argv)
     if ns.action == "path":
         print(skill_source())
         return 0
     if not ns.agent:
-        agents = [a for a, d in SKILL_TARGETS.items() if os.path.isdir(os.path.dirname(os.path.expanduser(d)))]
+        if ns.action != "status":
+            raise UsageError("choose which agents to %s for with --agent (%s, or all)"
+                             % (ns.action, ", ".join(SKILL_TARGETS)))
+        agents = list(SKILL_TARGETS)
     elif "all" in ns.agent:
         agents = list(SKILL_TARGETS)
     else:
@@ -1076,13 +1079,18 @@ def cmd_skill(argv):
         if ns.action == "uninstall":
             if ours and not ns.dry_run:
                 shutil.rmtree(dest)
-            print("%-8s %s %s" % (agent, "removed" if ours else "not installed", dest))
+            verb = ("would remove" if ns.dry_run else "removed") if ours else "not installed"
+            print("%-8s %s %s" % (agent, verb, dest))
             continue
         if not ns.dry_run:
             if ours:
                 shutil.rmtree(dest)
             shutil.copytree(src, dest, ignore=shutil.ignore_patterns(".DS_Store", "__pycache__"))
-        print("%-8s %s %s" % (agent, "updated" if ours else "installed", dest))
+        if ns.dry_run:
+            verb = "would update" if ours else "would install"
+        else:
+            verb = "updated" if ours else "installed"
+        print("%-8s %s %s" % (agent, verb, dest))
     return 0
 
 
@@ -1101,8 +1109,9 @@ Other commands:
   xc allow-folder <dir> --always    pre-permit a folder (sudo)
   xc deny <id> | xc logs
   xc daemon [status | stop [--all]] background connections held for agents
-  xc skill install [--agent NAME]   install the xcode-cli Agent Skill for Claude, Copilot,
-                                    Codex, Cursor, ~/.agents (also: uninstall, status, path)""")
+  xc skill install --agent NAME     install the xcode-cli Agent Skill for one agent (repeatable):
+                                    claude, copilot, codex, cursor, agents, or all
+                                    (also: uninstall --agent NAME, status, path)""")
 
 
 def main(argv):

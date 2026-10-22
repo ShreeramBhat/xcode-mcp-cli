@@ -44,10 +44,17 @@ agents to:
 It also includes a [reference for every tool](skills/xcode-cli/references/tools.md).
 
 ```sh
-xc skill install                  # every agent whose config folder exists
-xc skill install --agent copilot  # or: claude, codex, cursor, agents, all
-xc skill status | uninstall | path
+xc skill install --agent copilot      # one agent; repeat --agent for more
+xc skill install --agent all          # every supported agent
+xc skill status                       # where it's installed
+xc skill uninstall --agent copilot
+xc skill install --agent copilot --dry-run
 ```
+
+`install` and `uninstall` need `--agent`. Install the skill only for agents that should use
+`xc`: an agent that also has Xcode's MCP server registered gets conflicting guidance. Some
+folders are shared. Copilot and VS Code also read `~/.claude/skills` and `~/.agents/skills`, and
+Codex reads `~/.agents/skills`. So check the table below before choosing a folder.
 
 | Agent | Skill folder |
 |---|---|
@@ -57,7 +64,7 @@ xc skill status | uninstall | path
 | Cursor | `~/.cursor/skills` |
 | Shared (Codex, Copilot, OpenCode, …) | `~/.agents/skills` |
 
-`xc skill install` copies the skill, so run it again after `git pull` to update. It never
+`xc skill install` copies the skill, so run it again with the same `--agent` after `git pull` to update. It never
 overwrites a folder that holds a different skill.
 
 The skill can only steer an agent. If the agent still has Xcode's MCP server registered, it can
