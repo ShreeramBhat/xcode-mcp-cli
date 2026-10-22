@@ -33,6 +33,37 @@ ln -s "$PWD/xcode-mcp-cli/xc" ~/.local/bin/xc     # any directory on your PATH
 xc tools
 ```
 
+## Agent skill
+
+The repo includes an [Agent Skill](skills/xcode-cli/SKILL.md) (`xcode-cli`). It tells coding
+agents to:
+- treat `xc` as the main way to work with Xcode;
+- never connect to Xcode's MCP server directly (`xc` wraps `xcrun mcpbridge`);
+- use `xcodebuild`, `simctl`, `swift build` and similar tools only as a fallback.
+
+It also includes a [reference for every tool](skills/xcode-cli/references/tools.md).
+
+```sh
+xc skill install                  # every agent whose config folder exists
+xc skill install --agent copilot  # or: claude, codex, cursor, agents, all
+xc skill status | uninstall | path
+```
+
+| Agent | Skill folder |
+|---|---|
+| Claude Code | `~/.claude/skills` |
+| GitHub Copilot CLI | `~/.copilot/skills` |
+| OpenAI Codex | `~/.codex/skills` |
+| Cursor | `~/.cursor/skills` |
+| Shared (Codex, Copilot, OpenCode, …) | `~/.agents/skills` |
+
+`xc skill install` copies the skill, so run it again after `git pull` to update. It never
+overwrites a folder that holds a different skill.
+
+The skill can only steer an agent. If the agent still has Xcode's MCP server registered, it can
+still call it, so remove the `xcrun mcpbridge` entry from the agent's MCP config to make `xc`
+the only way in.
+
 ## Usage
 
 ```sh
@@ -59,6 +90,10 @@ include `build`, `run`, `stop`, `test`, `tests`, `open`, `close`, `ls`, `read`, 
 | Objects (JSON or `key=value`, flag can repeat) | `--options languageChoice=Swift --options coreData=false` |
 | Raw JSON | `--args '{"query":"SwiftData"}'`, or `--args -` to read stdin |
 | Show the request without sending it | `--dry-run` |
+
+If a tool has an argument with the same name as one of `xc`'s own options, the tool's argument
+keeps the name and `xc`'s option becomes `--xc-<name>`. For example, `xc preview` has its own
+`--timeout`, so `xc`'s timeout for it is `--xc-timeout`.
 
 **Workspace.** For tools that take a `workspaceIdentifier`, `xc` uses `-w/--workspace`, then
 `$XC_WORKSPACE`, then the nearest `.xcworkspace` or `.xcodeproj` above the current folder.

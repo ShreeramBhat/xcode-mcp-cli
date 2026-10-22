@@ -101,6 +101,16 @@ or approve from the terminal:
   xc status                              # find the pending request id
   xc approve <id> --always               # runs sudo xcrun mcp-server approve"""
 
+# Where each agent looks for personal Agent Skills (SKILL.md folders), keyed by agent.
+SKILL_NAME = "xcode-cli"
+SKILL_TARGETS = {
+    "claude": "~/.claude/skills",    # Claude Code (Copilot reads it too)
+    "copilot": "~/.copilot/skills",  # GitHub Copilot CLI
+    "codex": "~/.codex/skills",      # OpenAI Codex
+    "cursor": "~/.cursor/skills",    # Cursor
+    "agents": "~/.agents/skills",    # shared location read by Codex, Copilot, OpenCode and others
+}
+
 # Path-valued arguments that are resolved against the cwd before sending.
 ABSPATH_ARGS = {
     ("XcodeOpenWorkspace", "path"),
@@ -772,18 +782,24 @@ def coerce(value, schema, flag):
     return value
 
 
-def add_global_options(p):
+def add_global_options(p, taken=()):
+    """xc's own options. One whose long flag a tool argument already uses becomes --xc-<name>."""
     g = p.add_argument_group("output and connection")
-    g.add_argument("-w", "--workspace", help="workspace identifier or path (default: $XC_WORKSPACE, else found from cwd)")
-    g.add_argument("--args", dest="raw_args", metavar="JSON", help="tool arguments as a JSON object, or - to read stdin")
-    g.add_argument("--json", action="store_true", help="print the structured result as JSON")
-    g.add_argument("--raw", action="store_true", help="print the full MCP result")
-    g.add_argument("-o", "--out-dir", help="where to save image/binary results (default: a temp dir)")
-    g.add_argument("--dry-run", action="store_true", help="print the tool call instead of running it")
-    g.add_argument("--timeout", type=float, help="seconds to wait for the tool (default: no limit)")
-    g.add_argument("-q", "--quiet", action="store_true", help="hide progress messages")
-    g.add_argument("-v", "--verbose", action="store_true", help="show connection details and mcpbridge stderr")
-    g.add_argument("--no-daemon", action="store_true", help="connect to mcpbridge directly for this call")
+
+    def opt(short, name, **kw):
+        flag = "--xc-" + name if "--" + name in taken else "--" + name
+        g.add_argument(*([short, flag] if short else [flag]), dest=kw.pop("dest", name.replace("-", "_")), **kw)
+
+    opt("-w", "workspace", help="workspace identifier or path (default: $XC_WORKSPACE, else found from cwd)")
+    opt(None, "args", dest="raw_args", metavar="JSON", help="tool arguments as a JSON object, or - to read stdin")
+    opt(None, "json", action="store_true", help="print the structured result as JSON")
+    opt(None, "raw", action="store_true", help="print the full MCP result")
+    opt("-o", "out-dir", help="where to save image/binary results (default: a temp dir)")
+    opt(None, "dry-run", action="store_true", help="print the tool call instead of running it")
+    opt(None, "timeout", type=float, help="seconds xc waits for the tool (default: no limit)")
+    opt("-q", "quiet", action="store_true", help="hide progress messages")
+    opt("-v", "verbose", action="store_true", help="show connection details and mcpbridge stderr")
+    opt(None, "no-daemon", action="store_true", help="connect to mcpbridge directly for this call")
 
 
 def build_tool_parser(tool, tools):
@@ -803,6 +819,7 @@ def build_tool_parser(tool, tools):
     else:
         p.set_defaults(positional=[])
     g = p.add_argument_group("tool arguments")
+    taken = set()
     for name in sorted(props):
         if name == "workspaceIdentifier":
             continue
@@ -810,6 +827,7 @@ def build_tool_parser(tool, tools):
         flags = ["--" + kebab(name)]
         if kebab(name) != name:
             flags.append("--" + name)
+        taken.update(flags)
         t = ps.get("type")
         help_ = ps.get("description", "")
         if name in required:
@@ -828,7 +846,7 @@ def build_tool_parser(tool, tools):
             choices = ps.get("enum")
             meta = "{%s}" % ",".join(map(str, choices)) if choices else t.upper() if t else "VALUE"
             g.add_argument(*flags, dest="t_" + name, metavar=meta, help=help_)
-    add_global_options(p)
+    add_global_options(p, taken)
     return p
 
 
@@ -1016,6 +1034,58 @@ def cmd_server(argv):
     return subprocess.call(full)
 
 
+def skill_source():
+    src = os.path.join(os.path.dirname(os.path.realpath(__file__)), "skills", SKILL_NAME)
+    if not os.path.isfile(os.path.join(src, "SKILL.md")):
+        raise UsageError("skill files not found next to xc (%s); install xc from a clone of the repo" % src)
+    return src
+
+
+def cmd_skill(argv):
+    p = argparse.ArgumentParser(
+        prog="xc skill", description="Install the %s Agent Skill so coding agents use xc for Xcode work." % SKILL_NAME,
+        epilog="agents: " + ", ".join("%s (%s)" % kv for kv in SKILL_TARGETS.items()))
+    p.add_argument("action", choices=["install", "uninstall", "status", "path"])
+    p.add_argument("--agent", action="append", choices=sorted(SKILL_TARGETS) + ["all"],
+                   help="agent to (un)install for; repeatable (default: every agent whose config folder exists)")
+    p.add_argument("--dry-run", action="store_true", help="show what would change")
+    ns = p.parse_args(argv)
+    if ns.action == "path":
+        print(skill_source())
+        return 0
+    if not ns.agent:
+        agents = [a for a, d in SKILL_TARGETS.items() if os.path.isdir(os.path.dirname(os.path.expanduser(d)))]
+    elif "all" in ns.agent:
+        agents = list(SKILL_TARGETS)
+    else:
+        agents = ns.agent
+    src = skill_source() if ns.action == "install" else None
+    for agent in agents:
+        dest = os.path.join(os.path.expanduser(SKILL_TARGETS[agent]), SKILL_NAME)
+        manifest = os.path.join(dest, "SKILL.md")
+        ours = False
+        if os.path.isfile(manifest):
+            with open(manifest) as f:
+                ours = re.search(r"(?m)^name:\s*%s\s*$" % re.escape(SKILL_NAME), f.read()) is not None
+        if ns.action == "status":
+            print("%-8s %s  %s" % (agent, "installed" if ours else "-", dest))
+            continue
+        if os.path.exists(dest) and not ours:
+            print("%-8s skipped: %s exists and isn't this skill" % (agent, dest), file=sys.stderr)
+            continue
+        if ns.action == "uninstall":
+            if ours and not ns.dry_run:
+                shutil.rmtree(dest)
+            print("%-8s %s %s" % (agent, "removed" if ours else "not installed", dest))
+            continue
+        if not ns.dry_run:
+            if ours:
+                shutil.rmtree(dest)
+            shutil.copytree(src, dest, ignore=shutil.ignore_patterns(".DS_Store", "__pycache__"))
+        print("%-8s %s %s" % (agent, "updated" if ours else "installed", dest))
+    return 0
+
+
 def usage():
     print(__doc__.strip())
     print("""
@@ -1030,7 +1100,9 @@ Other commands:
   xc approve <id> --always          approve a pending agent/folder request (sudo)
   xc allow-folder <dir> --always    pre-permit a folder (sudo)
   xc deny <id> | xc logs
-  xc daemon [status | stop [--all]] background connections held for agents""")
+  xc daemon [status | stop [--all]] background connections held for agents
+  xc skill install [--agent NAME]   install the xcode-cli Agent Skill for Claude, Copilot,
+                                    Codex, Cursor, ~/.agents (also: uninstall, status, path)""")
 
 
 def main(argv):
@@ -1046,6 +1118,8 @@ def main(argv):
         return cmd_server([SERVER_SHORTCUTS[argv[0]]] + argv[1:])
     if argv[0] == "daemon":
         return cmd_daemon(argv[1:])
+    if argv[0] == "skill":
+        return cmd_skill(argv[1:])
     if argv[0] == "refresh":
         for f in os.listdir(CACHE_DIR) if os.path.isdir(CACHE_DIR) else []:
             os.remove(os.path.join(CACHE_DIR, f))
